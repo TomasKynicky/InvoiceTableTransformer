@@ -128,16 +128,22 @@ def extract_data(image, api_key: str) -> dict:
     if genai is None:
         raise RuntimeError("google-generativeai není nainstalováno.")
     genai.configure(api_key=api_key)
-    model = genai.GenerativeModel("gemini-3-flash-preview")
+    model = genai.GenerativeModel("gemini-1.5-flash")
     response = model.generate_content([PROMPT, image])
     text = response.text.strip()
+
+    print(f"DEBUG Gemini response: {text[:500]}")
+
     if text.startswith("```json"):
         text = text[7:]
+    if text.startswith("```"):
+        text = text[3:]
     if text.endswith("```"):
         text = text[:-3]
+    text = text.strip()
+
     try:
         data = json.loads(text)
-        # backward compatibility – starší odpovědi nemají s_dph / bez_dph
         polozky_raw = data.get("polozky", [])
         polozky = []
         for p in polozky_raw:
@@ -156,8 +162,9 @@ def extract_data(image, api_key: str) -> dict:
             "celkova_castka_bez_dph": data.get("celkova_castka_bez_dph", ""),
             "polozky": polozky
         }
-    except json.JSONDecodeError:
-        return {"error": f"Nepodařilo se parsovat: {response.text[:200]}"}
+    except json.JSONDecodeError as e:
+        print(f"JSON parse error: {e}, text: {text[:500]}")
+        return {"cislo_dokladu": "", "datum": "", "celkova_castka_s_dph": "", "celkova_castka_bez_dph": "", "polozky": [], "error": f"Nepodařilo se parsovat: {text[:200]}"}
 
 
 def save_to_excel(data: list, output_path: str):

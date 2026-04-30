@@ -38,6 +38,19 @@ if st.button("🚀 Zpracovat", disabled=not (api_key and uploaded_files)):
         st.error("Nahraj alespoň jeden soubor.")
         st.stop()
 
+    # Test API klíče
+    try:
+        import google.generativeai as genai
+        genai.configure(api_key=api_key)
+        models = genai.list_models()
+        available_models = [m.name for m in models]
+        if not any("gemini" in m.lower() for m in available_models):
+            st.error("API klíč nefunguje nebo nemáš přístup k Gemini modelům.")
+            st.stop()
+    except Exception as e:
+        st.error(f"Chyba při ověřování API klíče: {e}")
+        st.stop()
+
     progress_bar = st.progress(0, text="Příprava...")
 
     def on_progress(current, total, message):
@@ -56,6 +69,11 @@ if st.button("🚀 Zpracovat", disabled=not (api_key and uploaded_files)):
         st.stop()
     finally:
         progress_bar.empty()
+
+    # Zobrazit chyby z extrakce
+    for item in data:
+        if item.get("error"):
+            st.warning(f"{item.get('cislo_dokladu', 'Neznámý soubor')}: {item['error']}")
 
     # Uložení do Excelu do paměti
     output_bytes = io.BytesIO()
