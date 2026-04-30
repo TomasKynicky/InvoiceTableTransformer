@@ -1,6 +1,7 @@
 import concurrent.futures
 import io
 import json
+import os
 import re
 from pathlib import Path
 
@@ -10,6 +11,18 @@ try:
     import pdf2image
 except ImportError:
     pdf2image = None
+
+# Najdi cestu k poppleru
+def get_poppler_path():
+    possible_paths = [
+        "/opt/homebrew/bin",  # macOS Apple Silicon
+        "/usr/local/bin",      # macOS Intel
+        "/usr/bin",            # Linux
+    ]
+    for path in possible_paths:
+        if os.path.exists(os.path.join(path, "pdftoppm")):
+            return path
+    return None
 
 try:
     import google.generativeai as genai
@@ -67,12 +80,16 @@ def convert_pdf_to_images(file_input, dpi=200):
     """
     if pdf2image is None:
         raise RuntimeError("pdf2image není nainstalováno.")
+    poppler_path = get_poppler_path()
+    kwargs = {"dpi": dpi}
+    if poppler_path:
+        kwargs["poppler_path"] = poppler_path
     if isinstance(file_input, (str, Path)):
-        return pdf2image.convert_from_path(str(file_input), dpi=dpi)
+        return pdf2image.convert_from_path(str(file_input), **kwargs)
     if isinstance(file_input, bytes):
-        return pdf2image.convert_from_bytes(file_input, dpi=dpi)
+        return pdf2image.convert_from_bytes(file_input, **kwargs)
     # file-like
-    return pdf2image.convert_from_bytes(file_input.read(), dpi=dpi)
+    return pdf2image.convert_from_bytes(file_input.read(), **kwargs)
 
 
 def normalize_amount(value) -> str:
