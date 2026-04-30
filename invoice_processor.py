@@ -145,7 +145,7 @@ def extract_data(image, api_key: str) -> dict:
     if genai is None:
         raise RuntimeError("google-generativeai není nainstalováno.")
     genai.configure(api_key=api_key)
-    models_to_try = ["gemini-3.1-flash-lite", "gemini-3-flash"]
+    models_to_try = ["gemini-1.5-flash-latest", "gemini-1.5-pro-latest"]
     response = None
     for model_name in models_to_try:
         try:
