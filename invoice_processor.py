@@ -145,8 +145,19 @@ def extract_data(image, api_key: str) -> dict:
     if genai is None:
         raise RuntimeError("google-generativeai není nainstalováno.")
     genai.configure(api_key=api_key)
-    model = genai.GenerativeModel("gemini-1.5-flash")
-    response = model.generate_content([PROMPT, image])
+    models_to_try = ["gemini-3.1-flash-lite", "gemini-3-flash"]
+    response = None
+    for model_name in models_to_try:
+        try:
+            model = genai.GenerativeModel(model_name)
+            response = model.generate_content([PROMPT, image])
+            break
+        except Exception:
+            if model_name == models_to_try[-1]:
+                raise
+            continue
+    if response is None:
+        raise RuntimeError("Žádný model Gemini není dostupný.")
     text = response.text.strip()
 
     print(f"DEBUG Gemini response: {text[:500]}")
