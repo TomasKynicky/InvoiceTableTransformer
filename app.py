@@ -1,10 +1,11 @@
 import io
 import os
 import sys
+import tempfile
 from pathlib import Path
 
 import streamlit as st
-from invoice_processor import process_files, save_to_excel
+from invoice_processor import process_file, export_to_excel
 
 DEFAULT_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 
@@ -18,88 +19,89 @@ api_key = st.text_input(
     "Gemini API klíč",
     value=DEFAULT_API_KEY,
     type="password",
-    help="Najdeš na https://aistudio.google.com/app/apikey  (proměnná GEMINI_API_KEY se načte automaticky)"
 )
 
-# --- Nahrání souborů ---
+# --- Upload ---
 uploaded_files = st.file_uploader(
     "Nahraj soubory",
     type=["pdf", "jpg", "jpeg", "png", "bmp", "tiff", "gif"],
     accept_multiple_files=True,
-    help="Můžeš nahrát najednou více PDF i obrázků."
 )
 
-# --- Zpracování ---
+# --- Processing ---
 if st.button("🚀 Zpracovat", disabled=not (api_key and uploaded_files)):
-    if not api_key:
-        st.error("Zadej API klíč.")
+
+    progress = st.progress(0, text="Start...")
+
+    all_items = []
+    first_meta = None
+
+    for i, uf in enumerate(uploaded_files):
+        progress.progress(i / len(uploaded_files), text=f"Zpracovávám {uf.name}...")
+
+        # 🔥 uložit temp file (nutné!)
+        suffix = Path(uf.name).suffix
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            tmp.write(uf.read())
+            tmp_path = tmp.name
+
+        try:
+            data = process_file(tmp_path, api_key)
+
+            if not first_meta:
+                first_meta = data
+
+            all_items.extend(data.get("polozky", []))
+
+        except Exception as e:
+            st.warning(f"{uf.name}: {e}")
+
+        finally:
+            os.remove(tmp_path)
+
+    progress.empty()
+
+    if not all_items:
+        st.error("Nepodařilo se extrahovat žádná data.")
         st.stop()
-    if not uploaded_files:
-        st.error("Nahraj alespoň jeden soubor.")
-        st.stop()
 
-    # Test API klíče
-    try:
-        import google.generativeai as genai
-        genai.configure(api_key=api_key)
-        models = genai.list_models()
-        available_models = [m.name for m in models]
-        if not any("gemini" in m.lower() for m in available_models):
-            st.error("API klíč nefunguje nebo nemáš přístup k Gemini modelům.")
-            st.stop()
-    except Exception as e:
-        st.error(f"Chyba při ověřování API klíče: {e}")
-        st.stop()
+    merged = {
+        "cislo_dokladu": first_meta.get("cislo_dokladu", ""),
+        "datum": first_meta.get("datum", ""),
+        "dodavatel": first_meta.get("dodavatel", {}),
+        "polozky": all_items
+    }
 
-    progress_bar = st.progress(0, text="Příprava...")
+    # --- Excel ---
+    tmp_path = (
+        "/tmp/vystup.xlsx"
+        if sys.platform != "win32"
+        else os.path.join(os.environ.get("TEMP", "."), "vystup.xlsx")
+    )
 
-    def on_progress(current, total, message):
-        pct = min(current / total, 1.0) if total else 0.0
-        progress_bar.progress(pct, text=message)
+    export_to_excel(merged, tmp_path)
 
-    files = []
-    for uf in uploaded_files:
-        uf.seek(0)
-        files.append((uf.name, uf.read()))
-
-    try:
-        data = process_files(files, api_key=api_key, progress_callback=on_progress)
-    except Exception as e:
-        st.error(f"Chyba při zpracování: {e}")
-        st.stop()
-    finally:
-        progress_bar.empty()
-
-    # Zobrazit chyby z extrakce
-    for item in data:
-        if item.get("error"):
-            st.warning(f"{item.get('cislo_dokladu', 'Neznámý soubor')}: {item['error']}")
-
-    # Uložení do Excelu do paměti
-    output_bytes = io.BytesIO()
-    tmp_path = "/tmp/vystup_streamlit.xlsx" if sys.platform != "win32" else os.path.join(os.environ.get("TEMP", "."), "vystup_streamlit.xlsx")
-    save_to_excel(data, tmp_path)
     with open(tmp_path, "rb") as f:
-        output_bytes.write(f.read())
-    output_bytes.seek(0)
+        output_bytes = f.read()
 
-    st.success("Hotovo! Můžeš si stáhnout výsledný soubor.")
+    st.success("Hotovo!")
+
     st.download_button(
-        label="📥 Stáhnout vystup.xlsx",
+        label="📥 Stáhnout Excel",
         data=output_bytes,
         file_name="vystup.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
 
-    # Zobrazení náhledu
-    with st.expander("🔍 Náhled dat"):
+    # --- Preview ---
+    with st.expander("🔍 Náhled"):
         import pandas as pd
+
         try:
-            output_bytes.seek(0)
-            df = pd.read_excel(output_bytes)
+            df = pd.read_excel(io.BytesIO(output_bytes))
             st.dataframe(df, use_container_width=True)
         except Exception as e:
             st.info(f"Náhled není dostupný: {e}")
 
 st.markdown("---")
-st.caption("🛠️ V případě problémů zkontroluj API klíč a formát nahraných souborů.")
+st.caption("Hotovo 🚀")
