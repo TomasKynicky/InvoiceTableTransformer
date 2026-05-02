@@ -1,4 +1,3 @@
-import concurrent.futures
 import io
 import json
 import os
@@ -12,18 +11,6 @@ try:
 except ImportError:
     pdf2image = None
 
-# Najdi cestu k poppleru
-def get_poppler_path():
-    possible_paths = [
-        "/opt/homebrew/bin",  # macOS Apple Silicon
-        "/usr/local/bin",      # macOS Intel
-        "/usr/bin",            # Linux
-    ]
-    for path in possible_paths:
-        if os.path.exists(os.path.join(path, "pdftoppm")):
-            return path
-    return None
-
 try:
     import google.generativeai as genai
 except ImportError:
@@ -35,290 +22,291 @@ except ImportError:
     openpyxl = None
 
 
-PROMPT = """Z následujícího dokumentu (faktura nebo účtenka) extrahuj:
-- Číslo dokumentu nebo faktury
-- Datum vystavení nebo datum prodeje (formát: DD.MM.YYYY nebo DD.MM.YYYY, HH:MM:SS pro účtenky)
-- Celková částka k zaplacení s DPH (pouze číslo, bez měny)
-- Položky faktury/účtenky – pro každou položku uveď:
-  * název
-  * množství
-  * jednotkovou cenu s DPH
-  * jednotkovou cenu bez DPH (pokud je na dokladu explicitně uvedena; jinak nech prázdné)
-  * celkovou cenu s DPH
-  * celkovou cenu bez DPH (pokud je na dokladu explicitně uvedena; jinak nech prázdné)
+# =========================
+# PROMPT
+# =========================
 
-Odpověz ve formátu JSON bez markdown značek:
+PROMPT = """
+Extrahuj fakturu do JSON:
+
 {
-    "cislo_dokladu": "",
-    "datum": "",
-    "celkova_castka_s_dph": "",
-    "celkova_castka_bez_dph": "",
-    "polozky": [
-        {
-            "nazev": "",
-            "mnozstvi": "",
-            "cena_za_jednotku_s_dph": "",
-            "cena_za_jednotku_bez_dph": "",
-            "celkova_cena_s_dph": "",
-            "celkova_cena_bez_dph": ""
-        }
-    ]
+  "cislo_dokladu": "",
+  "datum": "",
+  "dodavatel": {
+    "nazev": "",
+    "ico": ""
+  },
+  "celkova_castka_s_dph": "",
+  "polozky": [
+    {
+      "nazev": "",
+      "mnozstvi": "",
+      "mj": "",
+      "cena_za_jednotku": "",
+      "cena_celkem": "",
+      "cena_celkem_bez_dph": "",
+      "cena_celkem_s_dph": "",
+      "dph": "",
+      "osoba": ""
+    }
+  ]
 }
 
-DŮLEŽITÉ – částka:
-- Pokud je číslo jako "6172518087" bez desetinné části, znamená to 6172518,87 Kč (poslední 2 cifry jsou desetinné)
-- Pokud je číslo jako "2975.00" nebo "2975" jde o 2975 Kč
-- NIKDY neuváděj jako částku celé číslo bez desetinné části pokud existuje desetinná (např. 21273,00)"""
+PRAVIDLA:
+- osoba = poslední krátké slovo v řádku (např. Hanzal, DK)
+- pokud není → "Nerozpoznané jméno"
+- cena_celkem_bez_dph = pokud existuje sloupec bez DPH
+- cena_celkem_s_dph = pokud existuje sloupec s DPH
+- pokud existuje jen jedna → dej ji do cena_celkem
+- zvládni multiline položky
+"""
+
+
+# =========================
+# UTILS
+# =========================
+
+def get_poppler_path():
+    for path in ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin"]:
+        if os.path.exists(os.path.join(path, "pdftoppm")):
+            return path
+    return None
 
 
 def convert_pdf_to_images(file_input, dpi=200):
-    """
-    file_input can be:
-      - str or Path -> convert_from_path
-      - bytes or file-like object -> convert_from_bytes
-    Returns list of PIL Images.
-    """
     if pdf2image is None:
-        raise RuntimeError("pdf2image není nainstalováno.")
-    poppler_path = get_poppler_path()
+        raise RuntimeError("pdf2image není nainstalováno")
+
     kwargs = {"dpi": dpi}
-    if poppler_path:
-        kwargs["poppler_path"] = poppler_path
-    if isinstance(file_input, (str, Path)):
-        return pdf2image.convert_from_path(str(file_input), **kwargs)
-    if isinstance(file_input, bytes):
-        return pdf2image.convert_from_bytes(file_input, **kwargs)
-    # file-like
-    return pdf2image.convert_from_bytes(file_input.read(), **kwargs)
+    poppler = get_poppler_path()
+    if poppler:
+        kwargs["poppler_path"] = poppler
+
+    return pdf2image.convert_from_path(str(file_input), **kwargs)
 
 
-def normalize_amount(value) -> str:
+def parse_price(value: str) -> str:
     if not value:
         return ""
-    text = str(value).strip()
-    result = ""
-    has_dot = '.' in text
-    has_comma = ',' in text
 
-    if has_dot and not has_comma:
-        parts = text.split('.')
-        int_part = parts[0]
-        dec_part = parts[1][:2] if len(parts) > 1 else '00'
-        if int(dec_part) == 0 and len(parts[1]) <= 2:
-            result = int_part
-        else:
-            result = int_part + ',' + dec_part
-    elif has_comma:
-        parts = text.split(',')
-        result = parts[0] + ',' + parts[1][:2]
-    else:
-        nums = re.findall(r'\d+', text)
-        if nums:
-            num_str = ''.join(nums)
-            if len(num_str) > 2:
-                result = num_str[:-2] + ',' + num_str[-2:]
-            else:
-                result = '0,' + num_str.zfill(2)
+    cleaned = re.sub(r"[^\d.,]", "", value)
+    cleaned = cleaned.replace(" ", "").replace(",", ".")
 
-    while result.endswith(',00') or result.endswith(',0'):
-        if result.endswith(',00'):
-            result = result[:-3]
-        elif result.endswith(',0'):
-            result = result[:-2]
+    if re.fullmatch(r"\d+", cleaned):
+        if len(cleaned) > 2:
+            cleaned = f"{cleaned[:-2]}.{cleaned[-2:]}"
 
-    if result == '':
-        return '0'
-    return result
+    parts = cleaned.split(".")
+    if len(parts) > 2:
+        cleaned = f"{''.join(parts[:-1])}.{parts[-1]}"
+
+    return cleaned
 
 
-def parse_amount(value: str) -> float:
-    if not value:
-        return 0.0
-    clean = value.replace(' ', '').replace(',', '.')
+def safe_float(val: str) -> float:
     try:
-        return float(clean)
-    except Exception:
+        return float(val.replace(",", "."))
+    except:
         return 0.0
 
+
+def extract_person_name(text: str) -> str:
+    words = re.findall(r"\b\w+\b", text)
+    if not words:
+        return "Nerozpoznané jméno"
+
+    last = words[-1]
+
+    if (
+        len(last) <= 10
+        and last[0].isupper()
+        and not re.search(r"\d", last)
+    ):
+        return last
+
+    return "Nerozpoznané jméno"
+
+
+def compute_price_with_dph(item):
+    """
+    🔥 KLÍČOVÁ LOGIKA DPH
+    """
+
+    bez = safe_float(item.get("cena_celkem_bez_dph", ""))
+    s = safe_float(item.get("cena_celkem_s_dph", ""))
+
+    if s > 0:
+        return s
+
+    if bez > 0:
+        # fallback 21 %
+        return round(bez * 1.21, 2)
+
+    # fallback na obecné pole
+    return safe_float(item.get("cena_celkem", ""))
+
+
+# =========================
+# AI
+# =========================
 
 def extract_data(image, api_key: str) -> dict:
-    if genai is None:
-        raise RuntimeError("google-generativeai není nainstalováno.")
     genai.configure(api_key=api_key)
-    models_to_try = ["gemini-3.1-flash-lite-preview", "gemini-3-flash-preview"]
-    response = None
-    for model_name in models_to_try:
-        try:
-            model = genai.GenerativeModel(model_name)
-            response = model.generate_content([PROMPT, image])
-            break
-        except Exception:
-            if model_name == models_to_try[-1]:
-                raise
-            continue
-    if response is None:
-        raise RuntimeError("Žádný model Gemini není dostupný.")
+
+    model = genai.GenerativeModel("gemini-3-flash-preview")
+    response = model.generate_content([PROMPT, image])
+
     text = response.text.strip()
-
-    print(f"DEBUG Gemini response: {text[:500]}")
-
-    if text.startswith("```json"):
-        text = text[7:]
-    if text.startswith("```"):
-        text = text[3:]
-    if text.endswith("```"):
-        text = text[:-3]
-    text = text.strip()
+    text = text.replace("```json", "").replace("```", "").strip()
 
     try:
         data = json.loads(text)
-        polozky_raw = data.get("polozky", [])
-        polozky = []
-        for p in polozky_raw:
-            polozky.append({
-                "nazev": p.get("nazev", ""),
-                "mnozstvi": p.get("mnozstvi", ""),
-                "cena_za_jednotku_s_dph": p.get("cena_za_jednotku_s_dph", p.get("cena_za_jednotku", "")),
-                "cena_za_jednotku_bez_dph": p.get("cena_za_jednotku_bez_dph", ""),
-                "celkova_cena_s_dph": p.get("celkova_cena_s_dph", p.get("celkova_cena", "")),
-                "celkova_cena_bez_dph": p.get("celkova_cena_bez_dph", "")
-            })
+    except:
         return {
-            "cislo_dokladu": data.get("cislo_dokladu", ""),
-            "datum": data.get("datum", ""),
-            "celkova_castka_s_dph": data.get("celkova_castka_s_dph", data.get("celkova_castka", "")),
-            "celkova_castka_bez_dph": data.get("celkova_castka_bez_dph", ""),
-            "polozky": polozky
+            "cislo_dokladu": "",
+            "datum": "",
+            "dodavatel": {"nazev": "", "ico": ""},
+            "celkova_castka_s_dph": "",
+            "polozky": []
         }
-    except json.JSONDecodeError as e:
-        print(f"JSON parse error: {e}, text: {text[:500]}")
-        return {"cislo_dokladu": "", "datum": "", "celkova_castka_s_dph": "", "celkova_castka_bez_dph": "", "polozky": [], "error": f"Nepodařilo se parsovat: {text[:200]}"}
+
+    supplier = data.get("dodavatel", {"nazev": "", "ico": ""})
+
+    polozky = []
+
+    for p in data.get("polozky", []):
+        osoba = p.get("osoba") or extract_person_name(p.get("nazev", ""))
+
+        polozky.append({
+            "nazev": p.get("nazev", ""),
+            "mnozstvi": p.get("mnozstvi", ""),
+            "mj": p.get("mj", ""),
+
+            "cena_za_jednotku": parse_price(p.get("cena_za_jednotku", "")),
+
+            "cena_celkem": parse_price(p.get("cena_celkem", "")),
+            "cena_celkem_bez_dph": parse_price(p.get("cena_celkem_bez_dph", "")),
+            "cena_celkem_s_dph": parse_price(p.get("cena_celkem_s_dph", "")),
+
+            "dph": parse_price(p.get("dph", "")),
+            "osoba": osoba,
+
+            "dodavatel_nazev": supplier.get("nazev", ""),
+            "dodavatel_ico": supplier.get("ico", "")
+        })
+
+    return {
+        "cislo_dokladu": data.get("cislo_dokladu", ""),
+        "datum": data.get("datum", ""),
+        "dodavatel": supplier,
+        "celkova_castka_s_dph": parse_price(data.get("celkova_castka_s_dph", "")),
+        "polozky": polozky
+    }
 
 
-def save_to_excel(data: list, output_path: str):
-    if openpyxl is None:
-        raise RuntimeError("openpyxl není nainstalováno.")
+# =========================
+# GROUPING
+# =========================
+
+def group_by_person(items):
+    grouped = {}
+    for item in items:
+        name = item.get("osoba") or "Nerozpoznané jméno"
+        grouped.setdefault(name, []).append(item)
+    return grouped
+
+
+# =========================
+# EXCEL
+# =========================
+
+def export_to_excel(data, path):
     wb = openpyxl.Workbook()
-    ws = wb.active
-    ws.title = "Faktury a účtenky"
+    wb.remove(wb.active)
 
-    headers = [
-        "Číslo dokladu", "Den", "Název položky/Popis",
-        "Cena za ks bez DPH", "Cena za ks s DPH",
-        "ks", "Celkem bez DPH", "Celkem s DPH"
-    ]
-    ws.append(headers)
+    grouped = group_by_person(data["polozky"])
 
-    total_bez = 0.0
-    total_s = 0.0
-    for item in data:
-        cislo = item.get("cislo_dokladu", "")
-        datum = item.get("datum", "")
-        polozky = item.get("polozky", [])
+    summary = []
+    grand_total = 0.0
 
-        if polozky:
-            for p in polozky:
-                nazev = p.get("nazev", "")
-                mnozstvi = str(p.get("mnozstvi", "")).strip()
-                cena_bez = normalize_amount(p.get("cena_za_jednotku_bez_dph", ""))
-                cena_s = normalize_amount(p.get("cena_za_jednotku_s_dph", ""))
-                celkem_bez = normalize_amount(p.get("celkova_cena_bez_dph", ""))
-                celkem_s = normalize_amount(p.get("celkova_cena_s_dph", ""))
+    for person, items in grouped.items():
+        ws = wb.create_sheet(title=person[:31] or "Neznámé")
 
-                row = [
-                    cislo,
-                    datum,
-                    nazev,
-                    cena_bez,
-                    cena_s,
-                    mnozstvi,
-                    celkem_bez,
-                    celkem_s
-                ]
-                ws.append(row)
-                total_bez += parse_amount(celkem_bez)
-                total_s += parse_amount(celkem_s)
-        else:
-            ws.append([cislo, datum, "", "", "", "", "", ""])
+        ws.append([
+            "Doklad", "Datum", "Dodavatel", "IČO",
+            "Název", "Množství", "MJ",
+            "Cena/ks", "Bez DPH", "S DPH"
+        ])
 
-    ws.append(["", "", "", "", "", "", "", ""])
-    ws.append([
-        "", "CELKEM", "", "", "", "",
-        f"{total_bez:.2f}".replace('.', ',') if total_bez else "",
-        f"{total_s:.2f}".replace('.', ',') if total_s else ""
-    ])
+        total = 0.0
 
-    for col in ws.columns:
-        max_length = max(len(str(cell.value or "")) for cell in col)
-        ws.column_dimensions[col[0].column_letter].width = min(max_length + 2, 50)
+        for p in items:
+            price_with_dph = compute_price_with_dph(p)
+            total += price_with_dph
 
-    wb.save(output_path)
-    return output_path
+            ws.append([
+                data["cislo_dokladu"],
+                data["datum"],
+                p["dodavatel_nazev"],
+                p["dodavatel_ico"],
+                p["nazev"],
+                p["mnozstvi"],
+                p["mj"],
+                p["cena_za_jednotku"],
+                p["cena_celkem_bez_dph"],
+                f"{price_with_dph:.2f}".replace(".", ",")
+            ])
+
+        summary.append((person, total))
+        grand_total += total
+
+    ws = wb.create_sheet("Přehled")
+    ws.append(["Osoba", "Celkem s DPH"])
+
+    for name, total in summary:
+        ws.append([name, f"{total:.2f}".replace(".", ",")])
+
+    ws.append(["CELKEM", f"{grand_total:.2f}".replace(".", ",")])
+
+    wb.save(path)
 
 
-def _process_single_file(filename, file_input, api_key):
-    image_extensions = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".gif"}
-    ext = Path(filename).suffix.lower()
-    try:
-        if ext == ".pdf":
-            images = convert_pdf_to_images(file_input, dpi=150)
-        elif ext in image_extensions:
-            if isinstance(file_input, (str, Path)):
-                images = [Image.open(file_input)]
-            elif isinstance(file_input, bytes):
-                images = [Image.open(io.BytesIO(file_input))]
-            else:
-                images = [Image.open(file_input)]
-        else:
-            return {"cislo_dokladu": filename, "datum": "", "celkova_castka": "", "polozky": [], "error": "Nepodporovaný formát"}
+# =========================
+# MAIN
+# =========================
 
-        all_polozky = []
-        first_data = None
-        for j, img in enumerate(images):
-            data = extract_data(img, api_key)
-            if j == 0:
-                first_data = data
-            if data.get("polozky"):
-                all_polozky.extend(data.get("polozky", []))
+def process_file(path, api_key):
+    images = convert_pdf_to_images(path)
 
-        if first_data:
-            first_data["polozky"] = all_polozky
-            return first_data
-        else:
-            return {"cislo_dokladu": filename, "datum": "", "celkova_castka": "", "polozky": []}
-    except Exception as e:
-        return {"cislo_dokladu": filename, "datum": "", "celkova_castka": "", "polozky": [], "error": str(e)}
+    all_items = []
+    first = None
+
+    for i, img in enumerate(images):
+        data = extract_data(img, api_key)
+
+        if i == 0:
+            first = data
+
+        all_items.extend(data.get("polozky", []))
+
+    if not first:
+        return {}
+
+    first["polozky"] = all_items
+    return first
 
 
-def process_files(files, api_key: str, progress_callback=None, max_workers=4):
-    """
-    files: list of (filename, file_bytes_or_path)
-    progress_callback: optional callable(current, total, message)
-    max_workers: kolik souborů se zpracovává paralelně (default 4)
-    Returns list of dicts compatible with save_to_excel.
-    """
-    all_data = [None] * len(files)
-    total = len(files)
+if __name__ == "__main__":
+    import sys
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_to_index = {
-            executor.submit(_process_single_file, filename, file_input, api_key): i
-            for i, (filename, file_input) in enumerate(files)
-        }
+    pdf = sys.argv[1]
+    api_key = sys.argv[2]
 
-        completed = 0
-        for future in concurrent.futures.as_completed(future_to_index):
-            i = future_to_index[future]
-            try:
-                all_data[i] = future.result()
-            except Exception as e:
-                all_data[i] = {"cislo_dokladu": files[i][0], "datum": "", "celkova_castka": "", "polozky": [], "error": str(e)}
+    data = process_file(pdf, api_key)
 
-            completed += 1
-            if progress_callback:
-                progress_callback(completed, total, f"Zpracováno {completed}/{total}")
+    with open("output.json", "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
 
-    if progress_callback:
-        progress_callback(total, total, "Hotovo")
+    export_to_excel(data, "output.xlsx")
 
-    return all_data
+    print("DONE")
