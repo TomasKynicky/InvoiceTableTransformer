@@ -288,6 +288,19 @@ def compute_price_with_dph(item):
     return safe_float(item.get("cena_celkem", ""))
 
 
+def compute_price_bez_dph(item):
+    bez = safe_float(item.get("cena_celkem_bez_dph", ""))
+
+    if bez > 0:
+        return bez
+
+    s = safe_float(item.get("cena_celkem_s_dph", ""))
+    if s > 0:
+        return round(s / 1.21, 2)
+
+    return safe_float(item.get("cena_celkem", ""))
+
+
 # =========================
 # AI
 # =========================
@@ -413,14 +426,19 @@ def group_by_category(items):
 # EXCEL EXPORT
 # =========================
 
+def _supplier_key(item):
+    nazev = item.get("dodavatel_nazev", "")
+    ico = item.get("dodavatel_ico", "")
+    if ico:
+        return f"{nazev} {ico}".strip()
+    return nazev if nazev else "Neznámý dodavatel"
+
+
 def export_to_excel(data, path):
     wb = openpyxl.Workbook()
     wb.remove(wb.active)
 
     grouped = group_by_category(data["polozky"])
-
-    summary = []
-    grand_total = 0.0
 
     for category, items in grouped.items():
         sheet_title = category[:31] if category else UNCATEGORIZED
@@ -428,11 +446,8 @@ def export_to_excel(data, path):
 
         ws.append(COLUMNS)
 
-        total = 0.0
-
         for p in items:
             price_with_dph = compute_price_with_dph(p)
-            total += price_with_dph
 
             ws.append([
                 data["cislo_dokladu"],
@@ -447,16 +462,50 @@ def export_to_excel(data, path):
                 f"{price_with_dph:.2f}".replace(".", ",")
             ])
 
-        summary.append((category, total))
-        grand_total += total
+    summary_data = {}
+    supplier_keys = set()
+
+    for item in data["polozky"]:
+        osoba = item.get("kategorie") or UNCATEGORIZED
+        if osoba in NOT_CATEGORY_WORDS:
+            osoba = UNCATEGORIZED
+
+        sup_key = _supplier_key(item)
+        supplier_keys.add(sup_key)
+
+        amount = compute_price_bez_dph(item)
+
+        if osoba not in summary_data:
+            summary_data[osoba] = {}
+        summary_data[osoba][sup_key] = summary_data[osoba].get(sup_key, 0.0) + amount
+
+    sorted_suppliers = sorted(supplier_keys)
+
+    headers = ["Osoba", "Celkem BEZ DPH"] + sorted_suppliers
 
     ws = wb.create_sheet(SUMMARY_SHEET)
-    ws.append(["Kategorie", "Celkem s DPH"])
+    ws.append(headers)
 
-    for name, total in summary:
-        ws.append([name, f"{total:.2f}".replace(".", ",")])
+    grand_totals = {sk: 0.0 for sk in sorted_suppliers}
+    grand_total_all = 0.0
 
-    ws.append(["CELKEM", f"{grand_total:.2f}".replace(".", ",")])
+    for osoba in sorted(summary_data.keys()):
+        row_totals = summary_data[osoba]
+        row_total = sum(row_totals.get(sk, 0.0) for sk in sorted_suppliers)
+
+        row = [osoba, f"{row_total:.2f}".replace(".", ",")]
+        for sk in sorted_suppliers:
+            val = row_totals.get(sk, 0.0)
+            row.append(f"{val:.2f}".replace(".", ","))
+            grand_totals[sk] += val
+
+        ws.append(row)
+        grand_total_all += row_total
+
+    total_row = ["CELKEM", f"{grand_total_all:.2f}".replace(".", ",")]
+    for sk in sorted_suppliers:
+        total_row.append(f"{grand_totals[sk]:.2f}".replace(".", ","))
+    ws.append(total_row)
 
     wb.save(path)
 
@@ -500,7 +549,10 @@ def import_from_excel(path):
                 "cena_celkem_s_dph": str(row_dict.get("S DPH", "")),
             })
 
-    first = all_items[0] if all_items else {}
+    if not all_items:
+        return EMPTY_RESULT
+
+    first = all_items[0]
 
     data = {
         "cislo_dokladu": first.get("cislo_dokladu", ""),
