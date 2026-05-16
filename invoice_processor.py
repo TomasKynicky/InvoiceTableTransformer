@@ -31,8 +31,15 @@ logger = logging.getLogger(__name__)
 
 SYSTEM_INSTRUCTION = """Jsi expert na extrakci dat z českých faktur a účtenek.
 Pracuješ s obrázky dokumentů, které mohou obsahovat tabulky s položkami.
-Každý řádek tabulky může mít jedno slovo napsané ČERVENOU barvou — to je kategorie.
-Kategorie slouží k rozdělení položek do skupin (např. jména osob, zkratky poboček, kódy).
+
+NEJDŮLEŽITĚJŠÍ PRAVIDLO — KATEGORIE:
+V každém řádku tabulky polozek hledej EXKLUSIVNĚ slovo napsané ČERVENOU barvou.
+- Pouze ČERVENÉ slovo v řádku = kategorie. Nic jiného.
+- Pokud v řádku NENÍ červené slovo, kategorie = "Nezařazeno".
+- Černý, modrý, zelený, jakýkoliv jiný text NENÍ kategorie — ani když vypadá jako jméno.
+- Slova "DPH", "dph", "Daň", "daň", "%" nejsou NIKDY kategorie, ani když jsou červená.
+
+Kategorie se používá k rozdělení položek do skupin (jména osob, zkratky poboček, kódy).
 Dbej na přesnost: čísla musí být přesná, kategorie musí být správně rozpoznány.
 Nikdy neinventuj data, která v dokumentu nejsou."""
 
@@ -67,16 +74,16 @@ SCHEMA:
 }
 
 PRAVIDLA:
-1. kategorie = slovo napsané ČERVENOU barvou v daném řádku (např. Hanzal, DK, 3%, DKM, GL, SDL, PROFI, 96074076)
-2. Pokud v řádku není červené slovo → "Nezařazeno"
-3. ČERVENÉ slovo je KATEGORIE, nikdy jej nezaměňuj s DPH ani jiným popiskem
-4. Slova "DPH", "dph", "Daň", "dan" nejsou kategorie ani když jsou červená
-5. cena_celkem_bez_dph = hodnota ze sloupce bez DPH, pokud existuje
-6. cena_celkem_s_dph = hodnota ze sloupce s DPH, pokud existuje
-7. Pokud je jen jeden cenový sloupec → dej hodnotu do cena_celkem
-8. Zvládni multiline položky (jeden záznam rozložený na více řádcích)
-9. Číslovky přepisuj přesně tak, jak jsou v dokumentu (včetně desetinných čárek/teček)
-10. Pokud nějaký údaj v dokumentu chybí, nech prázdný řetězec ""
+1. KATEGORIE: Pouze a exkluzivně slovo napsané ČERVENOU barvou v daném řádku (např. Hanzal, DK, 3%, DKM, GL, SDL, PROFI, 96074076).
+   - Pokud v řádku není ČERVENÉ slovo → "Nezařazeno"
+   - ČERNÝ, MODRÝ nebo jiný barevný text NENÍ kategorie — ani když vypadá jako jméno
+   - Slova "DPH", "dph", "Daň", "daň", "%" nejsou NIKDY kategorie, ani když jsou červená
+2. cena_celkem_bez_dph = hodnota ze sloupce bez DPH, pokud existuje
+3. cena_celkem_s_dph = hodnota ze sloupce s DPH, pokud existuje
+4. Pokud je jen jeden cenový sloupec → dej hodnotu do cena_celkem
+5. Zvládni multiline položky (jeden záznam rozložený na více řádcích)
+6. Číslovky přepisuj přesně tak, jak jsou v dokumentu (včetně desetinných čárek/teček)
+7. Pokud nějaký údaj v dokumentu chybí, nech prázdný řetězec ""
 
 PRIKLAD SPRÁVNÉHO VÝSTUPU:
 {
@@ -106,9 +113,24 @@ PRIKLAD SPRÁVNÉHO VÝSTUPU:
       "cena_celkem_s_dph": "",
       "dph": "",
       "kategorie": "DKM"
+    },
+    {
+      "nazev": "Služba bez červeného označení",
+      "mnozstvi": "2",
+      "mj": "hod",
+      "cena_za_jednotku": "500,00",
+      "cena_celkem": "1 000,00",
+      "cena_celkem_bez_dph": "",
+      "cena_celkem_s_dph": "",
+      "dph": "",
+      "kategorie": "Nezařazeno"
     }
   ]
-}"""
+}
+
+VŠIMNI SI: "Hanzal" a "DKM" jsou červeně napsané slova v dokumentu.
+"Nezařazeno" se používá, když v řádku není červené slovo.
+Nikdy nedávej do kategorie slovo, které NENÍ červené!"""
 
 
 # =========================
