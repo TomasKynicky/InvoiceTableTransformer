@@ -450,15 +450,15 @@ def export_to_excel(data, path):
             price_with_dph = compute_price_with_dph(p)
 
             ws.append([
-                data["cislo_dokladu"],
-                data["datum"],
-                p["dodavatel_nazev"],
-                p["dodavatel_ico"],
-                p["nazev"],
-                p["mnozstvi"],
-                p["mj"],
-                p["cena_za_jednotku"],
-                p["cena_celkem_bez_dph"],
+                data["cislo_dokladu"] or "",
+                data["datum"] or "",
+                p.get("dodavatel_nazev", "") or "",
+                p.get("dodavatel_ico", "") or "",
+                p.get("nazev", "") or "",
+                p.get("mnozstvi", "") or "",
+                p.get("mj", "") or "",
+                p.get("cena_za_jednotku", "") or "",
+                p.get("cena_celkem_bez_dph", "") or "",
                 f"{price_with_dph:.2f}".replace(".", ",")
             ])
 
