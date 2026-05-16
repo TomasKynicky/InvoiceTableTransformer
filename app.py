@@ -5,7 +5,7 @@ import tempfile
 from pathlib import Path
 
 import streamlit as st
-from invoice_processor import process_file, export_to_excel
+from invoice_processor import process_file, export_to_excel, import_from_excel
 
 DEFAULT_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 
@@ -102,6 +102,59 @@ if st.button("🚀 Zpracovat", disabled=not (api_key and uploaded_files)):
             st.dataframe(df, use_container_width=True)
         except Exception as e:
             st.info(f"Náhled není dostupný: {e}")
+
+# --- Import existujícího Excelu ---
+st.markdown("---")
+st.subheader("📂 Import Excelu")
+
+imported_file = st.file_uploader(
+    "Nahraj existující Excel pro úpravu",
+    type=["xlsx"],
+    key="import_uploader",
+)
+
+if imported_file and st.button("📥 Načíst Excel"):
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp:
+        tmp.write(imported_file.read())
+        tmp_path = tmp.name
+
+    try:
+        data = import_from_excel(tmp_path)
+
+        tmp_out = (
+            "/tmp/vystup_import.xlsx"
+            if sys.platform != "win32"
+            else os.path.join(os.environ.get("TEMP", "."), "vystup_import.xlsx")
+        )
+
+        export_to_excel(data, tmp_out)
+
+        with open(tmp_out, "rb") as f:
+            output_bytes = f.read()
+
+        st.success(f"Načteno {len(data['polozky'])} položek z {len(set(p.get('kategorie', '') for p in data['polozky']))} kategorií.")
+
+        st.download_button(
+            label="📥 Stáhnout aktualizovaný Excel",
+            data=output_bytes,
+            file_name="vystup_import.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+
+        with st.expander("🔍 Náhled"):
+            import pandas as pd
+
+            try:
+                df = pd.read_excel(io.BytesIO(output_bytes))
+                st.dataframe(df, use_container_width=True)
+            except Exception as e:
+                st.info(f"Náhled není dostupný: {e}")
+
+    except Exception as e:
+        st.error(f"Chyba pri čtení Excelu: {e}")
+
+    finally:
+        os.remove(tmp_path)
 
 st.markdown("---")
 st.caption("Hotovo 🚀")

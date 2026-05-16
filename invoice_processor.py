@@ -1,7 +1,9 @@
 import io
 import json
+import logging
 import os
 import re
+import time
 from pathlib import Path
 
 from PIL import Image
@@ -21,45 +23,169 @@ try:
 except ImportError:
     openpyxl = None
 
+logger = logging.getLogger(__name__)
+
+# =========================
+# SYSTEM INSTRUCTION
+# =========================
+
+SYSTEM_INSTRUCTION = """Jsi expert na extrakci dat z českých faktur a účtenek.
+Pracuješ s obrázky dokumentů, které mohou obsahovat tabulky s položkami.
+Každý řádek tabulky může mít jedno slovo napsané ČERVENOU barvou — to je kategorie.
+Kategorie slouží k rozdělení položek do skupin (např. jména osob, zkratky poboček, kódy).
+Dbej na přesnost: čísla musí být přesná, kategorie musí být správně rozpoznány.
+Nikdy neinventuj data, která v dokumentu nejsou."""
 
 # =========================
 # PROMPT
 # =========================
 
-PROMPT = """
-Extrahuj fakturu do JSON:
+PROMPT = """Extrahuj všechny položky z této faktury/účtenky do JSON formátu.
 
+SCHEMA:
 {
-  "cislo_dokladu": "",
-  "datum": "",
+  "cislo_dokladu": "číslo dokladu z dokumentu",
+  "datum": "datum vystavení",
   "dodavatel": {
-    "nazev": "",
-    "ico": ""
+    "nazev": "název dodavatele",
+    "ico": "IČO dodavatele"
   },
-  "celkova_castka_s_dph": "",
+  "celkova_castka_s_dph": "celková částka s DPH",
   "polozky": [
     {
-      "nazev": "",
-      "mnozstvi": "",
-      "mj": "",
-      "cena_za_jednotku": "",
-      "cena_celkem": "",
-      "cena_celkem_bez_dph": "",
-      "cena_celkem_s_dph": "",
-      "dph": "",
-      "osoba": ""
+      "nazev": "název položky",
+      "mnozstvi": "množství",
+      "mj": "měrná jednotka (ks, kg, l, m2, hod atd.)",
+      "cena_za_jednotku": "cena za jednotku",
+      "cena_celkem": "celková cena (pokud je jen jeden cenový sloupec)",
+      "cena_celkem_bez_dph": "celková cena bez DPH (pokud existuje)",
+      "cena_celkem_s_dph": "celková cena s DPH (pokud existuje)",
+      "dph": "sazba DPH v % nebo částka DPH",
+      "kategorie": "červeně napsané slovo v řádku"
     }
   ]
 }
 
 PRAVIDLA:
-- osoba = poslední krátké slovo v řádku (např. Hanzal, DK)
-- pokud není → "Nerozpoznané jméno"
-- cena_celkem_bez_dph = pokud existuje sloupec bez DPH
-- cena_celkem_s_dph = pokud existuje sloupec s DPH
-- pokud existuje jen jedna → dej ji do cena_celkem
-- zvládni multiline položky
-"""
+1. kategorie = slovo napsané ČERVENOU barvou v daném řádku (např. Hanzal, DK, 3%, DKM, GL, SDL, PROFI, 96074076)
+2. Pokud v řádku není červené slovo → "Nezařazeno"
+3. ČERVENÉ slovo je KATEGORIE, nikdy jej nezaměňuj s DPH ani jiným popiskem
+4. Slova "DPH", "dph", "Daň", "dan" nejsou kategorie ani když jsou červená
+5. cena_celkem_bez_dph = hodnota ze sloupce bez DPH, pokud existuje
+6. cena_celkem_s_dph = hodnota ze sloupce s DPH, pokud existuje
+7. Pokud je jen jeden cenový sloupec → dej hodnotu do cena_celkem
+8. Zvládni multiline položky (jeden záznam rozložený na více řádcích)
+9. Číslovky přepisuj přesně tak, jak jsou v dokumentu (včetně desetinných čárek/teček)
+10. Pokud nějaký údaj v dokumentu chybí, nech prázdný řetězec ""
+
+PRIKLAD SPRÁVNÉHO VÝSTUPU:
+{
+  "cislo_dokladu": "FV2024001",
+  "datum": "15.3.2024",
+  "dodavatel": {"nazev": "ABC s.r.o.", "ico": "12345678"},
+  "celkova_castka_s_dph": "5 000,00",
+  "polozky": [
+    {
+      "nazev": "Montáž žaluzií",
+      "mnozstvi": "10",
+      "mj": "ks",
+      "cena_za_jednotku": "400,00",
+      "cena_celkem": "",
+      "cena_celkem_bez_dph": "3 305,79",
+      "cena_celkem_s_dph": "4 000,00",
+      "dph": "21",
+      "kategorie": "Hanzal"
+    },
+    {
+      "nazev": "Dodávka materiálu",
+      "mnozstvi": "1",
+      "mj": "sada",
+      "cena_za_jednotku": "1 000,00",
+      "cena_celkem": "1 000,00",
+      "cena_celkem_bez_dph": "",
+      "cena_celkem_s_dph": "",
+      "dph": "",
+      "kategorie": "DKM"
+    }
+  ]
+}"""
+
+
+# =========================
+# JSON SCHEMA for structured output
+# =========================
+
+RESPONSE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "cislo_dokladu": {"type": "string"},
+        "datum": {"type": "string"},
+        "dodavatel": {
+            "type": "object",
+            "properties": {
+                "nazev": {"type": "string"},
+                "ico": {"type": "string"}
+            },
+            "required": ["nazev", "ico"]
+        },
+        "celkova_castka_s_dph": {"type": "string"},
+        "polozky": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "nazev": {"type": "string"},
+                    "mnozstvi": {"type": "string"},
+                    "mj": {"type": "string"},
+                    "cena_za_jednotku": {"type": "string"},
+                    "cena_celkem": {"type": "string"},
+                    "cena_celkem_bez_dph": {"type": "string"},
+                    "cena_celkem_s_dph": {"type": "string"},
+                    "dph": {"type": "string"},
+                    "kategorie": {"type": "string"}
+                },
+                "required": [
+                    "nazev", "mnozstvi", "mj",
+                    "cena_za_jednotku", "cena_celkem",
+                    "cena_celkem_bez_dph", "cena_celkem_s_dph",
+                    "dph", "kategorie"
+                ]
+            }
+        }
+    },
+    "required": ["cislo_dokladu", "datum", "dodavatel", "celkova_castka_s_dph", "polozky"]
+}
+
+EMPTY_RESULT = {
+    "cislo_dokladu": "",
+    "datum": "",
+    "dodavatel": {"nazev": "", "ico": ""},
+    "celkova_castka_s_dph": "",
+    "polozky": []
+}
+
+# =========================
+# CONSTANTS
+# =========================
+
+COLUMNS = [
+    "Doklad", "Datum", "Dodavatel", "IČO",
+    "Název", "Množství", "MJ",
+    "Cena/ks", "Bez DPH", "S DPH"
+]
+
+SUMMARY_SHEET = "Přehled"
+
+NOT_CATEGORY_WORDS = {
+    "dph", "DPH", "daň", "Daň", "dan", "Dan",
+    "DP", "dp", "Nezařazeno", "celkem", "Celkem",
+    "suma", "Suma", "součet", "Součet",
+}
+
+UNCATEGORIZED = "Nezařazeno"
+
+MAX_RETRIES = 3
+RETRY_DELAYS = [2, 5, 10]
 
 
 # =========================
@@ -73,7 +199,7 @@ def get_poppler_path():
     return None
 
 
-def convert_pdf_to_images(file_input, dpi=200):
+def convert_pdf_to_images(file_input, dpi=300):
     if pdf2image is None:
         raise RuntimeError("pdf2image není nainstalováno")
 
@@ -110,28 +236,24 @@ def safe_float(val: str) -> float:
         return 0.0
 
 
-def extract_person_name(text: str) -> str:
+def guess_category(text: str) -> str:
     words = re.findall(r"\b\w+\b", text)
     if not words:
-        return "Nerozpoznané jméno"
+        return UNCATEGORIZED
 
-    last = words[-1]
+    for word in reversed(words):
+        if (
+            len(word) <= 15
+            and (word[0].isupper() or word[0].isdigit())
+            and not re.search(r"\d{4,}", word)
+            and word not in NOT_CATEGORY_WORDS
+        ):
+            return word
 
-    if (
-        len(last) <= 10
-        and last[0].isupper()
-        and not re.search(r"\d", last)
-    ):
-        return last
-
-    return "Nerozpoznané jméno"
+    return UNCATEGORIZED
 
 
 def compute_price_with_dph(item):
-    """
-    🔥 KLÍČOVÁ LOGIKA DPH
-    """
-
     bez = safe_float(item.get("cena_celkem_bez_dph", ""))
     s = safe_float(item.get("cena_celkem_s_dph", ""))
 
@@ -139,10 +261,8 @@ def compute_price_with_dph(item):
         return s
 
     if bez > 0:
-        # fallback 21 %
         return round(bez * 1.21, 2)
 
-    # fallback na obecné pole
     return safe_float(item.get("cena_celkem", ""))
 
 
@@ -150,56 +270,105 @@ def compute_price_with_dph(item):
 # AI
 # =========================
 
-def extract_data(image, api_key: str) -> dict:
+def _create_model(api_key: str):
     genai.configure(api_key=api_key)
 
-    model = genai.GenerativeModel("gemini-3-flash-preview")
-    response = model.generate_content([PROMPT, image])
+    return genai.GenerativeModel(
+        model_name="gemini-2.5-flash",
+        system_instruction=SYSTEM_INSTRUCTION,
+        generation_config=genai.GenerationConfig(
+            response_mime_type="application/json",
+            response_schema=RESPONSE_SCHEMA,
+            temperature=0.0,
+        ),
+    )
 
-    text = response.text.strip()
-    text = text.replace("```json", "").replace("```", "").strip()
 
-    try:
-        data = json.loads(text)
-    except:
-        return {
-            "cislo_dokladu": "",
-            "datum": "",
-            "dodavatel": {"nazev": "", "ico": ""},
-            "celkova_castka_s_dph": "",
-            "polozky": []
-        }
+def extract_data(image, api_key: str) -> dict:
+    model = _create_model(api_key)
 
+    for attempt in range(MAX_RETRIES):
+        try:
+            response = model.generate_content([PROMPT, image])
+
+            if not response.text:
+                logger.warning("Prázdná odpověď, pokus %d/%d", attempt + 1, MAX_RETRIES)
+                continue
+
+            text = response.text.strip()
+
+            try:
+                data = json.loads(text)
+            except json.JSONDecodeError:
+                cleaned = text.replace("```json", "").replace("```", "").strip()
+                try:
+                    data = json.loads(cleaned)
+                except json.JSONDecodeError:
+                    logger.warning("JSON parse selhal, pokus %d/%d", attempt + 1, MAX_RETRIES)
+                    if attempt < MAX_RETRIES - 1:
+                        time.sleep(RETRY_DELAYS[attempt])
+                    continue
+
+            if "polozky" not in data or not isinstance(data["polozky"], list):
+                logger.warning("Chybí polozky v odpovědi, pokus %d/%d", attempt + 1, MAX_RETRIES)
+                if attempt < MAX_RETRIES - 1:
+                    time.sleep(RETRY_DELAYS[attempt])
+                continue
+
+            return _process_extracted(data)
+
+        except Exception as e:
+            logger.warning("Chyba pri extrakci (pokus %d/%d): %s", attempt + 1, MAX_RETRIES, e)
+            if attempt < MAX_RETRIES - 1:
+                time.sleep(RETRY_DELAYS[attempt])
+
+    logger.error("Všechny pokusy o extrakci selhaly")
+    return EMPTY_RESULT
+
+
+def _process_extracted(data: dict) -> dict:
     supplier = data.get("dodavatel", {"nazev": "", "ico": ""})
+    if not isinstance(supplier, dict):
+        supplier = {"nazev": str(supplier), "ico": ""}
 
     polozky = []
 
     for p in data.get("polozky", []):
-        osoba = p.get("osoba") or extract_person_name(p.get("nazev", ""))
+        if not isinstance(p, dict):
+            continue
+
+        kategorie = (
+            p.get("kategorie")
+            or p.get("osoba")
+            or guess_category(p.get("nazev", ""))
+        )
+
+        if kategorie in NOT_CATEGORY_WORDS:
+            kategorie = UNCATEGORIZED
 
         polozky.append({
-            "nazev": p.get("nazev", ""),
-            "mnozstvi": p.get("mnozstvi", ""),
-            "mj": p.get("mj", ""),
+            "nazev": str(p.get("nazev", "")),
+            "mnozstvi": str(p.get("mnozstvi", "")),
+            "mj": str(p.get("mj", "")),
 
-            "cena_za_jednotku": parse_price(p.get("cena_za_jednotku", "")),
+            "cena_za_jednotku": parse_price(str(p.get("cena_za_jednotku", ""))),
 
-            "cena_celkem": parse_price(p.get("cena_celkem", "")),
-            "cena_celkem_bez_dph": parse_price(p.get("cena_celkem_bez_dph", "")),
-            "cena_celkem_s_dph": parse_price(p.get("cena_celkem_s_dph", "")),
+            "cena_celkem": parse_price(str(p.get("cena_celkem", ""))),
+            "cena_celkem_bez_dph": parse_price(str(p.get("cena_celkem_bez_dph", ""))),
+            "cena_celkem_s_dph": parse_price(str(p.get("cena_celkem_s_dph", ""))),
 
-            "dph": parse_price(p.get("dph", "")),
-            "osoba": osoba,
+            "dph": parse_price(str(p.get("dph", ""))),
+            "kategorie": kategorie,
 
             "dodavatel_nazev": supplier.get("nazev", ""),
             "dodavatel_ico": supplier.get("ico", "")
         })
 
     return {
-        "cislo_dokladu": data.get("cislo_dokladu", ""),
-        "datum": data.get("datum", ""),
+        "cislo_dokladu": str(data.get("cislo_dokladu", "")),
+        "datum": str(data.get("datum", "")),
         "dodavatel": supplier,
-        "celkova_castka_s_dph": parse_price(data.get("celkova_castka_s_dph", "")),
+        "celkova_castka_s_dph": parse_price(str(data.get("celkova_castka_s_dph", ""))),
         "polozky": polozky
     }
 
@@ -208,35 +377,34 @@ def extract_data(image, api_key: str) -> dict:
 # GROUPING
 # =========================
 
-def group_by_person(items):
+def group_by_category(items):
     grouped = {}
     for item in items:
-        name = item.get("osoba") or "Nerozpoznané jméno"
-        grouped.setdefault(name, []).append(item)
+        key = item.get("kategorie") or UNCATEGORIZED
+        if key in NOT_CATEGORY_WORDS:
+            key = UNCATEGORIZED
+        grouped.setdefault(key, []).append(item)
     return grouped
 
 
 # =========================
-# EXCEL
+# EXCEL EXPORT
 # =========================
 
 def export_to_excel(data, path):
     wb = openpyxl.Workbook()
     wb.remove(wb.active)
 
-    grouped = group_by_person(data["polozky"])
+    grouped = group_by_category(data["polozky"])
 
     summary = []
     grand_total = 0.0
 
-    for person, items in grouped.items():
-        ws = wb.create_sheet(title=person[:31] or "Neznámé")
+    for category, items in grouped.items():
+        sheet_title = category[:31] if category else UNCATEGORIZED
+        ws = wb.create_sheet(title=sheet_title)
 
-        ws.append([
-            "Doklad", "Datum", "Dodavatel", "IČO",
-            "Název", "Množství", "MJ",
-            "Cena/ks", "Bez DPH", "S DPH"
-        ])
+        ws.append(COLUMNS)
 
         total = 0.0
 
@@ -257,11 +425,11 @@ def export_to_excel(data, path):
                 f"{price_with_dph:.2f}".replace(".", ",")
             ])
 
-        summary.append((person, total))
+        summary.append((category, total))
         grand_total += total
 
-    ws = wb.create_sheet("Přehled")
-    ws.append(["Osoba", "Celkem s DPH"])
+    ws = wb.create_sheet(SUMMARY_SHEET)
+    ws.append(["Kategorie", "Celkem s DPH"])
 
     for name, total in summary:
         ws.append([name, f"{total:.2f}".replace(".", ",")])
@@ -272,17 +440,85 @@ def export_to_excel(data, path):
 
 
 # =========================
+# EXCEL IMPORT
+# =========================
+
+def import_from_excel(path):
+    wb = openpyxl.load_workbook(path)
+
+    all_items = []
+
+    for sheet_name in wb.sheetnames:
+        if sheet_name == SUMMARY_SHEET:
+            continue
+
+        ws = wb[sheet_name]
+
+        header = None
+        for row in ws.iter_rows(values_only=True):
+            if header is None:
+                header = list(row)
+                continue
+
+            row_dict = dict(zip(header, row))
+
+            kategorie = sheet_name
+
+            all_items.append({
+                "kategorie": kategorie,
+                "cislo_dokladu": str(row_dict.get("Doklad", "")),
+                "datum": str(row_dict.get("Datum", "")),
+                "dodavatel_nazev": str(row_dict.get("Dodavatel", "")),
+                "dodavatel_ico": str(row_dict.get("IČO", "")),
+                "nazev": str(row_dict.get("Název", "")),
+                "mnozstvi": str(row_dict.get("Množství", "")),
+                "mj": str(row_dict.get("MJ", "")),
+                "cena_za_jednotku": str(row_dict.get("Cena/ks", "")),
+                "cena_celkem_bez_dph": str(row_dict.get("Bez DPH", "")),
+                "cena_celkem_s_dph": str(row_dict.get("S DPH", "")),
+            })
+
+    first = all_items[0] if all_items else {}
+
+    data = {
+        "cislo_dokladu": first.get("cislo_dokladu", ""),
+        "datum": first.get("datum", ""),
+        "dodavatel": {
+            "nazev": first.get("dodavatel_nazev", ""),
+            "ico": first.get("dodavatel_ico", "")
+        },
+        "polozky": all_items
+    }
+
+    return data
+
+
+# =========================
 # MAIN
 # =========================
 
 def process_file(path, api_key):
-    images = convert_pdf_to_images(path)
+    suffix = Path(path).suffix.lower()
+
+    if suffix == ".pdf":
+        images = convert_pdf_to_images(path, dpi=300)
+    else:
+        img = Image.open(path)
+        if img.mode != "RGB":
+            img = img.convert("RGB")
+        images = [img]
 
     all_items = []
     first = None
 
     for i, img in enumerate(images):
+        if img.mode != "RGB":
+            img = img.convert("RGB")
+
         data = extract_data(img, api_key)
+
+        if not data.get("polozky"):
+            continue
 
         if i == 0:
             first = data
@@ -290,7 +526,7 @@ def process_file(path, api_key):
         all_items.extend(data.get("polozky", []))
 
     if not first:
-        return {}
+        return EMPTY_RESULT
 
     first["polozky"] = all_items
     return first
@@ -298,6 +534,8 @@ def process_file(path, api_key):
 
 if __name__ == "__main__":
     import sys
+
+    logging.basicConfig(level=logging.INFO)
 
     pdf = sys.argv[1]
     api_key = sys.argv[2]
